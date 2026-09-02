@@ -1,32 +1,23 @@
 """
 univers.py — Récupère la liste des titres du S&P 500.
 
-=============================================================================
-AVERTISSEMENT IMPORTANT — BIAIS DU SURVIVANT
-=============================================================================
-Ce module récupère la composition ACTUELLE du S&P 500.
+BIAIS DU SURVIVANT — à lire une fois, à retenir toujours.
+On récupère la composition ACTUELLE du S&P 500, pas la composition
+historique. Les sociétés sorties de l'indice (faillites, rachats) en sont
+absentes : un backtest sur cette liste ne pourra jamais acheter Lehman en
+2007 ni First Republic en 2022. Surestimation attendue : 1 à 4 points de
+performance annuelle. Si le backtest sort +12 %, la vérité est plutôt
+entre +8 % et +11 %.
 
-Ce n'est PAS la composition historique. Les sociétés sorties de l'indice
-(faillites, rachats, effondrements) n'y figurent pas.
-
-Conséquence concrète : un backtest lancé sur cette liste ne pourra jamais
-acheter Lehman Brothers en 2007, Enron en 2000, ou First Republic en 2022.
-On teste une stratégie sur un univers dont les désastres ont été retirés
-à l'avance. La littérature chiffre cette surestimation entre 1 et 4 points
-de performance annuelle.
-
-Traduction : si ton backtest sort +12 % par an, la vraie performance
-est probablement entre +8 % et +11 %. Retiens ce chiffre, il servira
-au moment de décider si la stratégie mérite un euro.
-
-Pour supprimer ce biais il faut un fournisseur qui conserve les titres
-délistés (Norgate, CRSP, Refinitiv). Ce n'est pas gratuit. Pour apprendre
-et prototyper, on accepte le biais — mais on l'écrit noir sur blanc.
-=============================================================================
+NOTE TECHNIQUE — pourquoi pas pd.read_html(url) directement.
+pandas télécharge la page en s'annonçant "Python-urllib". Wikipédia bloque
+cette signature et renvoie une erreur 403. On récupère donc la page nous-
+mêmes avec requests, puis on passe le HTML à pandas.
 """
 
 from __future__ import annotations
 
+import io
 import sys
 from pathlib import Path
 
@@ -36,44 +27,77 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config
 
 URL_WIKIPEDIA = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+URL_API_WIKIPEDIA = (
+    "https://en.wikipedia.org/w/api.php"
+    "?action=parse&page=List_of_S%26P_500_companies"
+    "&prop=text&format=json&formatversion=2"
+)
+
+# Wikimédia demande une signature identifiable. C'est leur règle, on la suit.
+ENTETES = {
+    "User-Agent": "StockMarketResearch/1.0 (projet personnel de recherche)",
+    "Accept": "text/html,application/json",
+}
+DELAI_SECONDES = 30
+
+
+def _recuperer_html() -> str:
+    """Télécharge le HTML avec une signature acceptée. Deux tentatives."""
+    import requests
+
+    erreurs: list[str] = []
+
+    try:
+        r = requests.get(URL_WIKIPEDIA, headers=ENTETES, timeout=DELAI_SECONDES)
+        r.raise_for_status()
+        return r.text
+    except Exception as e:  # noqa: BLE001
+        erreurs.append(f"page HTML : {type(e).__name__} — {e}")
+
+    try:
+        r = requests.get(URL_API_WIKIPEDIA, headers=ENTETES, timeout=DELAI_SECONDES)
+        r.raise_for_status()
+        return r.json()["parse"]["text"]
+    except Exception as e:  # noqa: BLE001
+        erreurs.append(f"API Wikipédia : {type(e).__name__} — {e}")
+
+    raise RuntimeError(
+        "Impossible de récupérer la liste du S&P 500.\n\n"
+        + "\n".join(f"  - {e}" for e in erreurs)
+        + "\n\nSOLUTION MANUELLE (2 minutes) :\n"
+        f"  1. Ouvre dans ton navigateur : {URL_WIKIPEDIA}\n"
+        "  2. Copie la colonne 'Symbol' du premier tableau.\n"
+        f"  3. Crée le fichier {config.FICHIER_UNIVERS} ainsi :\n"
+        "         ticker\n         AAPL\n         ABBV\n         ...\n"
+        "  4. Relance la commande : le fichier sera utilisé tel quel.\n"
+    )
 
 
 def _normaliser_ticker(ticker: str) -> str:
     """
-    Yahoo Finance utilise un tiret là où Wikipédia utilise un point.
-
-    Exemple : la classe B de Berkshire Hathaway s'écrit BRK.B chez S&P,
-    mais BRK-B chez Yahoo. Sans cette conversion, on perd silencieusement
-    quelques titres — et « silencieusement » est le mot dangereux.
+    Yahoo écrit BRK-B là où Wikipédia écrit BRK.B.
+    Sans cette conversion on perd des titres SILENCIEUSEMENT.
     """
     return ticker.strip().upper().replace(".", "-")
 
 
-def telecharger_univers() -> pd.DataFrame:
-    """
-    Va chercher la table des constituants sur Wikipédia.
-
-    Renvoie un DataFrame avec les colonnes :
-        ticker, nom, secteur, sous_secteur, date_ajout_indice
-    """
-    tables = pd.read_html(URL_WIKIPEDIA)
-
-    # La première table de la page est celle des constituants.
-    # On vérifie quand même : Wikipédia change de temps en temps.
-    df = None
+def _extraire_table(html: str) -> pd.DataFrame:
+    """Trouve le tableau des constituants parmi tous ceux de la page."""
+    tables = pd.read_html(io.StringIO(html))
     for table in tables:
         colonnes = {str(c).strip() for c in table.columns}
         if "Symbol" in colonnes and "Security" in colonnes:
-            df = table
-            break
+            return table
+    raise RuntimeError(
+        f"Aucun tableau exploitable ({len(tables)} tableaux analysés). "
+        "La structure de la page Wikipédia a changé."
+    )
 
-    if df is None:
-        raise RuntimeError(
-            "Impossible de trouver la table des constituants sur Wikipédia. "
-            "La structure de la page a probablement changé."
-        )
 
-    # On renomme en français et on ne garde que ce qui sert.
+def telecharger_univers() -> pd.DataFrame:
+    """Renvoie ticker, nom, secteur, sous_secteur, date_ajout_indice."""
+    df = _extraire_table(_recuperer_html())
+
     correspondances = {
         "Symbol": "ticker",
         "Security": "nom",
@@ -81,16 +105,21 @@ def telecharger_univers() -> pd.DataFrame:
         "GICS Sub-Industry": "sous_secteur",
         "Date added": "date_ajout_indice",
     }
-    colonnes_presentes = {
-        ancien: nouveau
-        for ancien, nouveau in correspondances.items()
-        if ancien in df.columns
-    }
-    df = df[list(colonnes_presentes)].rename(columns=colonnes_presentes)
+    presentes = {a: n for a, n in correspondances.items() if a in df.columns}
+    df = df[list(presentes)].rename(columns=presentes)
 
     df["ticker"] = df["ticker"].astype(str).map(_normaliser_ticker)
     df = df.drop_duplicates(subset="ticker").sort_values("ticker")
     df = df.reset_index(drop=True)
+
+    # Garde-fou : le S&P 500 compte ~503 lignes (doubles classes d'actions).
+    # Sans ce contrôle, le jour où la page change, tu lances un backtest sur
+    # un univers tronqué sans le savoir.
+    if not 450 <= len(df) <= 520:
+        raise RuntimeError(
+            f"Nombre de titres inattendu : {len(df)} (attendu 450 à 520). "
+            "Le tableau récupéré n'est probablement pas le bon."
+        )
 
     return df
 
@@ -99,13 +128,9 @@ def charger_univers(forcer_telechargement: bool = False) -> pd.DataFrame:
     """
     Renvoie l'univers, depuis le cache local si possible.
 
-    On met en cache pour deux raisons :
-      1. Ne pas dépendre de la disponibilité de Wikipédia à chaque exécution.
-      2. Surtout : garder une liste FIGÉE. Si la liste change entre le
-         téléchargement des prix et le backtest, on compare des choses
-         différentes sans s'en rendre compte.
-
-    forcer_telechargement=True pour rafraîchir volontairement.
+    Le cache sert surtout à FIGER la liste : si elle change entre le
+    téléchargement des prix et le backtest, on compare sans le savoir
+    deux univers différents.
     """
     if config.FICHIER_UNIVERS.exists() and not forcer_telechargement:
         df = pd.read_csv(config.FICHIER_UNIVERS)
@@ -131,7 +156,7 @@ if __name__ == "__main__":
     print()
     print("Aperçu :")
     print(univers.head(10).to_string(index=False))
-    print()
     if "secteur" in univers.columns:
+        print()
         print("Répartition sectorielle :")
         print(univers["secteur"].value_counts().to_string())
