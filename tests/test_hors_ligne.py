@@ -1,14 +1,12 @@
 """
 test_hors_ligne.py — Vérifie la logique SANS accès internet.
 
-Principe : on fabrique un jeu de données dont on connaît exactement les
-défauts, on le passe dans le contrôle qualité, et on vérifie que chaque
-défaut est bien détecté.
+Le test est coupé en deux : "doivent passer" et "doivent être écartés".
 
-C'est le seul moyen d'avoir confiance dans un contrôle : lui montrer une
-erreur qu'on a mise là exprès et vérifier qu'il la voit. Un contrôle qui
-ne signale jamais rien n'est pas un contrôle qui rassure — c'est un
-contrôle qui ne marche pas.
+La première moitié compte autant que la seconde. Le bug corrigé le
+02/09/2026 était un FAUX POSITIF : le contrôle voyait une anomalie là où il
+n'y en avait pas, et retirait 85 titres sur 503. Un test qui ne vérifiait
+que les vrais positifs ne l'aurait jamais attrapé.
 
 À lancer :   python tests/test_hors_ligne.py
 """
@@ -30,14 +28,11 @@ from src import qualite
 CALENDRIER = pd.bdate_range("2020-01-01", "2024-12-31")
 
 
-def _titre_sain(ticker: str, dates: pd.DatetimeIndex | None = None) -> pd.DataFrame:
-    """Un titre normal : marche aléatoire, dividendes retraités, volume réel."""
+def _titre_sain(ticker: str, dates=None, avec_dividende: bool = True) -> pd.DataFrame:
     dates = CALENDRIER if dates is None else dates
-    generateur = np.random.default_rng(abs(hash(ticker)) % (2**32))
-    rendements = generateur.normal(0.0004, 0.015, len(dates))
-    adj = 100 * np.exp(np.cumsum(rendements))
-    # Le prix brut est supérieur à l'ajusté : effet cumulé des dividendes.
-    facteur = np.linspace(1.0, 1.18, len(dates))
+    gen = np.random.default_rng(abs(hash(ticker)) % (2**32))
+    adj = 100 * np.exp(np.cumsum(gen.normal(0.0004, 0.015, len(dates))))
+    facteur = np.linspace(1.0, 1.18, len(dates)) if avec_dividende else np.ones(len(dates))
     close = adj * facteur
     return pd.DataFrame(
         {
@@ -48,62 +43,64 @@ def _titre_sain(ticker: str, dates: pd.DatetimeIndex | None = None) -> pd.DataFr
             "low": close * 0.988,
             "close": close,
             "adj_close": adj,
-            "volume": generateur.integers(500_000, 5_000_000, len(dates)),
+            "volume": gen.integers(500_000, 5_000_000, len(dates)),
         }
     )
 
 
 def construire_jeu_de_test() -> pd.DataFrame:
     blocs = []
+    milieu = len(CALENDRIER) // 2
 
-    # 1. Trois titres parfaitement sains — le témoin.
-    for ticker in ("SAIN1", "SAIN2", "SAIN3"):
-        blocs.append(_titre_sain(ticker))
+    # --- doivent PASSER ---
+    for t in ("SAIN1", "SAIN2", "SAIN3"):
+        blocs.append(_titre_sain(t))
 
-    # 2. Split 2 pour 1 CORRECTEMENT retraité.
-    #    Le prix brut est divisé par deux, l'ajusté ne bouge pas.
-    #    Le contrôle ne doit PAS écarter ce titre.
+    # Split 2:1 correctement retraité : le brut est divisé, l'ajusté non.
     bloc = _titre_sain("SPLITOK")
-    milieu = len(bloc) // 2
     bloc.loc[milieu:, ["open", "high", "low", "close"]] /= 2
     blocs.append(bloc)
 
-    # 3. Split 2 pour 1 NON retraité — l'erreur qui coûte cher.
-    #    L'ajusté chute de 50 % en une séance. Le signal va lire un krach.
+    # LE FAUX POSITIF CORRIGÉ — société sans dividende sur la période.
+    blocs.append(_titre_sain("SANSDIV", avec_dividende=False))
+
+    # Une seule ligne OHLC corrompue sur ~1300 : incident isolé.
+    bloc = _titre_sain("OHLC1")
+    bloc.loc[150, "low"] = bloc.loc[150, "high"] * 1.5
+    blocs.append(bloc)
+
+    # Introduction en bourse tardive : volume nul avant cotation (cas Amcor).
+    bloc = _titre_sain("IPOTARD")
+    bloc.loc[: milieu - 1, "volume"] = 0
+    blocs.append(bloc)
+
+    # Trou d'un mois : suspension de cotation légitime.
+    bloc = _titre_sain("TROU")
+    blocs.append(bloc.drop(index=bloc.index[300:322]))
+
+    # --- doivent être ÉCARTÉS ---
     bloc = _titre_sain("SPLITKO")
     bloc.loc[milieu:, ["open", "high", "low", "close", "adj_close"]] /= 2
     blocs.append(bloc)
 
-    # 4. Aucun ajustement : adj_close identique à close.
-    bloc = _titre_sain("NOADJ")
-    bloc["adj_close"] = bloc["close"]
-    blocs.append(bloc)
-
-    # 5. Dates en double.
     bloc = _titre_sain("DOUBLON")
     blocs.append(pd.concat([bloc, bloc.iloc[100:105]], ignore_index=True))
 
-    # 6. Prix à zéro.
     bloc = _titre_sain("ZERO")
     bloc.loc[200, ["open", "high", "low", "close", "adj_close"]] = 0.0
     blocs.append(bloc)
 
-    # 7. Volume nul sur 30 % des séances — titre illiquide.
+    # Volume nul DISPERSÉ sur 33 % des séances : vraie illiquidité.
     bloc = _titre_sain("ILLIQUIDE")
     bloc.loc[bloc.index[::3], "volume"] = 0
     blocs.append(bloc)
 
-    # 8. Introduction en bourse récente : 120 séances seulement.
     blocs.append(_titre_sain("JEUNE", CALENDRIER[-120:]))
 
-    # 9. Trou d'un mois dans l'historique.
-    bloc = _titre_sain("TROU")
-    a_retirer = bloc.index[300:322]
-    blocs.append(bloc.drop(index=a_retirer))
-
-    # 10. OHLC incohérent : plus-bas au-dessus du plus-haut.
+    # OHLC corrompu sur 10 % des lignes : flux douteux.
     bloc = _titre_sain("OHLCKO")
-    bloc.loc[150, "low"] = bloc.loc[150, "high"] * 1.5
+    idx = bloc.index[::10]
+    bloc.loc[idx, "low"] = bloc.loc[idx, "high"] * 1.5
     blocs.append(bloc)
 
     return pd.concat(blocs, ignore_index=True)
@@ -113,15 +110,17 @@ ATTENDUS = {
     "SAIN1": None,
     "SAIN2": None,
     "SAIN3": None,
-    "SPLITOK": None,                                  # ne doit PAS être écarté
+    "SPLITOK": None,
+    "SANSDIV": None,
+    "OHLC1": None,
+    "IPOTARD": None,
+    "TROU": None,
     "SPLITKO": "splits_probablement_non_retraites",
-    "NOADJ": "ajustement_absent",
     "DOUBLON": "dates_en_double",
     "ZERO": "prix_nuls_ou_negatifs",
     "ILLIQUIDE": "volume_nul_excessif",
     "JEUNE": "historique_insuffisant",
-    "TROU": "nb_trous",
-    "OHLCKO": "lignes_ohlc_incoherentes",
+    "OHLCKO": "ohlc_massivement_incoherent",
 }
 
 
@@ -132,51 +131,66 @@ def main() -> int:
     print()
 
     donnees = construire_jeu_de_test()
-    print(f"Jeu de test : {donnees['ticker'].nunique()} titres, "
-          f"{len(donnees)} lignes")
+    print(f"Jeu de test : {donnees['ticker'].nunique()} titres, {len(donnees)} lignes")
     print()
 
     rapport = qualite.controler(donnees).set_index("ticker")
-
     echecs = []
-    for ticker, colonne_attendue in ATTENDUS.items():
-        ligne = rapport.loc[ticker]
 
-        if colonne_attendue is None:
-            # On attend un titre propre.
-            if bool(ligne["a_ecarter"]):
-                echecs.append(
-                    f"{ticker} : écarté à tort — {ligne['motif']}"
-                )
-                verdict = "ÉCHEC"
-            else:
-                verdict = "ok"
-            print(f"  {verdict:<6} {ticker:<10} attendu sain")
+    print("  --- doivent PASSER ---")
+    for ticker, attendu in ATTENDUS.items():
+        if attendu is not None:
+            continue
+        ligne = rapport.loc[ticker]
+        if bool(ligne["a_ecarter"]):
+            echecs.append(f"{ticker} : écarté à tort — {ligne['motif']}")
+            print(f"  ÉCHEC  {ticker:<10} écarté à tort : {ligne['motif']}")
         else:
-            valeur = ligne[colonne_attendue]
-            detecte = bool(valeur) if isinstance(valeur, (bool, np.bool_)) else valeur > 0
-            if not detecte:
-                echecs.append(
-                    f"{ticker} : anomalie '{colonne_attendue}' NON détectée"
-                )
-                verdict = "ÉCHEC"
-            else:
-                verdict = "ok"
-            print(f"  {verdict:<6} {ticker:<10} attendu → {colonne_attendue}")
+            print(f"  ok     {ticker:<10}")
+
+    print()
+    print("  --- doivent être ÉCARTÉS ---")
+    for ticker, attendu in ATTENDUS.items():
+        if attendu is None:
+            continue
+        ligne = rapport.loc[ticker]
+        valeur = ligne[attendu]
+        detecte = bool(valeur) if isinstance(valeur, (bool, np.bool_)) else valeur > 0
+        if not detecte or not bool(ligne["a_ecarter"]):
+            echecs.append(f"{ticker} : '{attendu}' non détecté")
+            print(f"  ÉCHEC  {ticker:<10} attendu -> {attendu}")
+        else:
+            print(f"  ok     {ticker:<10} {attendu}")
+
+    print()
+    print("  --- contrôle global de l'ajustement ---")
+    ok, message = qualite.controler_ajustement_global(rapport.reset_index())
+    print(f"  {'ok    ' if ok else 'ÉCHEC '} {message.splitlines()[0]}")
+    if not ok:
+        echecs.append("contrôle global de l'ajustement en échec")
+
+    # Cas limite : un jeu SANS aucun ajustement doit déclencher l'alerte.
+    sans_ajustement = donnees.copy()
+    sans_ajustement["adj_close"] = sans_ajustement["close"]
+    rapport_ko = qualite.controler(sans_ajustement)
+    ok_ko, _ = qualite.controler_ajustement_global(rapport_ko)
+    if ok_ko:
+        echecs.append("l'alerte globale ne se déclenche pas sur un jeu non ajusté")
+        print("  ÉCHEC  l'alerte ne se déclenche pas quand adj_close == close partout")
+    else:
+        print("  ok     l'alerte se déclenche bien si AUCUN titre n'est ajusté")
 
     print()
     print("-" * 74)
     if echecs:
         print(f"{len(echecs)} TEST(S) EN ÉCHEC :")
-        for echec in echecs:
-            print(f"  - {echec}")
+        for e in echecs:
+            print(f"  - {e}")
         return 1
 
-    print("Tous les tests passent. Le contrôle qualité détecte bien")
-    print("les 9 anomalies injectées et ne signale aucun faux positif.")
+    print("Tous les tests passent : 8 titres sains conservés, 6 anomalies")
+    print("détectées, alerte globale fonctionnelle, aucun faux positif.")
     print()
-
-    # Aperçu du rendu réel.
     qualite.afficher_resume(rapport.reset_index(), donnees)
     return 0
 
