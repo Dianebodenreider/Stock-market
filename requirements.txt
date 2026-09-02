@@ -1,0 +1,8 @@
+# Dépendances du projet.
+# Installation :  pip install -r requirements.txt
+
+yfinance>=0.2.55        # téléchargement des prix depuis Yahoo Finance
+pandas>=2.0             # manipulation des tableaux de données
+numpy>=1.24             # calcul numérique
+pyarrow>=14.0           # lecture/écriture du format Parquet
+lxml>=5.0               # lecture de la table Wikipédia (liste S&P 500)
