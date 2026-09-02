@@ -1,0 +1,8 @@
+data/raw/*.parquet
+data/rapports/*.csv
+!data/raw/univers_sp500.csv
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
